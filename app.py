@@ -13,14 +13,17 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _load_settings() -> tuple[str, str]:
+def _load_settings() -> tuple[str, str | None, bool]:
+    """(spreadsheet_id, credentials_path or None, use_inline_service_account_from_secrets)"""
     root = _project_root()
     try:
         if "spreadsheet_id" not in st.secrets:
             raise KeyError
         sid = str(st.secrets["spreadsheet_id"]).strip()
+        if "gcp_service_account" in st.secrets:
+            return sid, None, True
         cred_rel = str(st.secrets.get("credentials_path", "secrets/service_account.json"))
-        return sid, str((root / cred_rel).resolve())
+        return sid, str((root / cred_rel).resolve()), False
     except Exception:
         pass
     sid = os.environ.get("SPREADSHEET_ID", "").strip()
@@ -29,12 +32,16 @@ def _load_settings() -> tuple[str, str]:
         cred = str((root / "secrets" / "service_account.json").resolve())
     else:
         cred = str(Path(cred).resolve())
-    return sid, cred
+    return sid, cred, False
 
 
 @st.cache_resource
-def _worksheet(credentials_path: str, spreadsheet_id: str):
-    return todo_sheets.open_first_worksheet(credentials_path, spreadsheet_id)
+def _spreadsheet(spreadsheet_id: str, credentials_path: str | None, use_inline_sa: bool):
+    if use_inline_sa:
+        info = {k: v for k, v in st.secrets["gcp_service_account"].items()}
+        return todo_sheets.open_spreadsheet_from_service_account_info(info, spreadsheet_id)
+    assert credentials_path is not None
+    return todo_sheets.open_spreadsheet(credentials_path, spreadsheet_id)
 
 
 def _task_sort_key(row: dict) -> tuple[date, str]:
@@ -42,7 +49,6 @@ def _task_sort_key(row: dict) -> tuple[date, str]:
     try:
         due = date.fromisoformat(due_raw)
     except ValueError:
-        # 期日が空欄/不正な場合は末尾表示にする
         due = date.max
     title = str(row.get("タイトル", ""))
     return due, title
@@ -60,6 +66,10 @@ def _due_status(due_raw: str) -> tuple[str, str]:
     if due_day == today:
         return "今日まで", "status-today"
     return "余裕あり", "status-upcoming"
+
+
+def _is_active_task(row: dict) -> bool:
+    return str(row.get("ステータス", "")).strip() != todo_sheets.STATUS_DONE
 
 
 def main() -> None:
@@ -142,7 +152,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    spreadsheet_id, credentials_path = _load_settings()
+    spreadsheet_id, credentials_path, use_inline_sa = _load_settings()
     if not spreadsheet_id:
         st.error("スプレッドシート ID が未設定です。")
         st.info(
@@ -152,13 +162,23 @@ def main() -> None:
         st.stop()
 
     try:
-        ws = _worksheet(credentials_path, spreadsheet_id)
+        sh = _spreadsheet(spreadsheet_id, credentials_path, use_inline_sa)
+        ws = sh.sheet1
     except Exception as e:
         st.error("スプレッドシートに接続できませんでした。")
         st.caption(str(e))
         st.info(
             "サービスアカウントのメールをスプレッドシートの「共有」に **編集者** で追加したか、"
             "`secrets/service_account.json` のパスが正しいか確認してください。"
+        )
+        st.stop()
+
+    if not todo_sheets.main_sheet_has_status_column(ws):
+        st.error("スプレッドシートの1行目に「ステータス」列がありません。")
+        st.info(
+            "先頭シートの **1行目** を次の列名にしてください（E列に追加）: "
+            "`id` / `タイトル` / `内容` / `期日` / **`ステータス`**。"
+            " 既存データの「ステータス」は空欄で問題ありません。"
         )
         st.stop()
 
@@ -177,7 +197,7 @@ def main() -> None:
             st.warning("タイトルを入力してください。")
         else:
             todo_sheets.add_task(ws, t_title.strip(), t_body.strip(), t_due.isoformat())
-            _worksheet.clear()
+            _spreadsheet.clear()
             st.success("追加しました。")
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
@@ -185,52 +205,77 @@ def main() -> None:
     st.divider()
     st.subheader("2. いまのタスクを確認・編集")
 
-    tasks = sorted(todo_sheets.list_tasks(ws), key=_task_sort_key)
-    st.markdown(f'<div class="quick-count">登録タスク数: <b>{len(tasks)}</b> 件</div>', unsafe_allow_html=True)
-    if not tasks:
-        st.caption("まだタスクがありません。上のフォームから追加してください。")
+    all_records = todo_sheets.list_tasks(ws)
+    active_tasks = sorted([r for r in all_records if _is_active_task(r)], key=_task_sort_key)
+    done_count = len(all_records) - len(active_tasks)
+
+    st.markdown(
+        f'<div class="quick-count">未完了: <b>{len(active_tasks)}</b> 件'
+        f'　·　完了（まだシート上に残っている）: <b>{done_count}</b> 件</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("完了済みタスクをアーカイブする", use_container_width=True, key="bulk_archive"):
+        moved, msg = todo_sheets.archive_completed_tasks(sh)
+        _spreadsheet.clear()
+        if moved:
+            st.success(f"{moved} 件を「Archive」シートへ移し、メインシートから削除しました。")
+        else:
+            st.info(msg)
+        st.rerun()
+
+    if not active_tasks:
+        st.caption("表示できる未完了タスクはありません。上のフォームから追加するか、完了済みはアーカイブしてください。")
         return
 
-    for row in tasks:
+    for row in active_tasks:
         tid = str(row.get("id", "")).strip()
         title = str(row.get("タイトル", ""))
         due_raw = str(row.get("期日", ""))
         status_text, status_class = _due_status(due_raw)
         prefix = "🟥" if status_text == "期限切れ" else "🟧" if status_text == "今日まで" else "🟩"
         label = f"{prefix} {title}" if title else f"{prefix} (無題)"
-        with st.expander(label):
-            if not tid:
-                st.warning("この行に id がありません。シートの見出し行を確認してください。")
-                continue
-            st.markdown(
-                f'<span class="status-badge {status_class}">{status_text}</span>',
-                unsafe_allow_html=True,
-            )
-            nt = st.text_input("タイトル", value=title, key=f"title_{tid}")
-            nc = st.text_area(
-                "内容",
-                value=str(row.get("内容", "")),
-                height=80,
-                key=f"body_{tid}",
-            )
-            nd = st.text_input("期日（YYYY-MM-DD）", value=due_raw, key=f"due_{tid}")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("保存する", type="primary", use_container_width=True, key=f"save_{tid}"):
-                    if todo_sheets.update_task(ws, tid, nt.strip(), nc.strip(), nd.strip()):
-                        _worksheet.clear()
-                        st.success("保存しました。")
-                        st.rerun()
-                    else:
-                        st.error("保存に失敗しました。")
-            with c2:
-                if st.button("削除する", use_container_width=True, key=f"del_{tid}"):
-                    if todo_sheets.delete_task(ws, tid):
-                        _worksheet.clear()
-                        st.success("削除しました。")
-                        st.rerun()
-                    else:
-                        st.error("削除に失敗しました。")
+
+        col_done, col_body = st.columns([1, 6])
+        with col_done:
+            if tid and st.button("✅", key=f"done_{tid}", help="完了にする", use_container_width=True):
+                if todo_sheets.mark_task_completed(ws, tid):
+                    _spreadsheet.clear()
+                    st.rerun()
+        with col_body:
+            with st.expander(label):
+                if not tid:
+                    st.warning("この行に id がありません。シートの見出し行を確認してください。")
+                    continue
+                st.markdown(
+                    f'<span class="status-badge {status_class}">{status_text}</span>',
+                    unsafe_allow_html=True,
+                )
+                nt = st.text_input("タイトル", value=title, key=f"title_{tid}")
+                nc = st.text_area(
+                    "内容",
+                    value=str(row.get("内容", "")),
+                    height=80,
+                    key=f"body_{tid}",
+                )
+                nd = st.text_input("期日（YYYY-MM-DD）", value=due_raw, key=f"due_{tid}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("保存する", type="primary", use_container_width=True, key=f"save_{tid}"):
+                        if todo_sheets.update_task(ws, tid, nt.strip(), nc.strip(), nd.strip()):
+                            _spreadsheet.clear()
+                            st.success("保存しました。")
+                            st.rerun()
+                        else:
+                            st.error("保存に失敗しました。")
+                with c2:
+                    if st.button("削除する", use_container_width=True, key=f"del_{tid}"):
+                        if todo_sheets.delete_task(ws, tid):
+                            _spreadsheet.clear()
+                            st.success("削除しました。")
+                            st.rerun()
+                        else:
+                            st.error("削除に失敗しました。")
 
 
 if __name__ == "__main__":
