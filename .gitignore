@@ -1,0 +1,26 @@
+# OAuth クライアント JSON（client_id / client_secret）— このフォルダに鍵を置く想定
+secrets/
+
+# Google がダウンロード時に付ける名前の例（ルートに置いた場合の保険）
+client_secret*.json
+
+# 初回ログイン後に自動生成されるトークン類
+token.json
+authorized_user.json
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
