@@ -4,6 +4,7 @@ import os
 from datetime import date
 from pathlib import Path
 
+import requests
 import streamlit as st
 
 from src import todo_sheets
@@ -70,6 +71,46 @@ def _due_status(due_raw: str) -> tuple[str, str]:
 
 def _is_active_task(row: dict) -> bool:
     return str(row.get("ステータス", "")).strip() != todo_sheets.STATUS_DONE
+
+
+def _parse_due_date(due_raw: str) -> date | None:
+    due_text = str(due_raw).strip()
+    try:
+        return date.fromisoformat(due_text)
+    except ValueError:
+        return None
+
+
+def _build_line_message(tasks: list[dict]) -> str:
+    lines = ["【Todo通知】今日が期日の未完了タスク"]
+    for t in tasks:
+        title = str(t.get("タイトル", "")).strip()
+        if title:
+            lines.append(f"・{title}")
+    return "\n".join(lines)
+
+
+def _send_line_broadcast(text: str) -> None:
+    if "line_messaging" not in st.secrets:
+        raise KeyError("line_messaging が Secrets に設定されていません。")
+    lm = st.secrets["line_messaging"]
+    token = str(lm.get("channel_access_token", "")).strip()
+    if not token:
+        raise KeyError("line_messaging.channel_access_token が空です。")
+    mode = str(lm.get("mode", "broadcast")).strip().lower()
+    if mode != "broadcast":
+        raise ValueError("現状は mode = \"broadcast\" のみ対応しています。")
+
+    url = "https://api.line.me/v2/bot/message/broadcast"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "messages": [{"type": "text", "text": text}],
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=30)
+    r.raise_for_status()
 
 
 def main() -> None:
@@ -185,6 +226,30 @@ def main() -> None:
     st.title("やることリスト")
     st.markdown('<p class="app-caption">入力は上、確認は下。迷わない1画面です。</p>', unsafe_allow_html=True)
 
+    # --- LINE通知（起動時に1日1回だけ送るガード） ---
+    today = date.today()
+    all_records_for_notify = todo_sheets.list_tasks(ws)
+    due_today_pending = [
+        r
+        for r in all_records_for_notify
+        if _parse_due_date(r.get("期日", "")) == today
+        and str(r.get("ステータス", "")).strip() != todo_sheets.STATUS_DONE
+    ]
+
+    # Streamlit は再実行されるため、セッション内で「今日は送ったか」を覚えて二重送信を防ぐ
+    sent_key = f"line_sent_{today.isoformat()}"
+    if sent_key not in st.session_state and due_today_pending:
+        try:
+            msg = _build_line_message(due_today_pending)
+            _send_line_broadcast(msg)
+            st.session_state[sent_key] = True
+            st.success("LINEに通知を送りました（今日が期日のタスク）。")
+        except Exception as e:
+            st.info(f"LINE通知は未設定または失敗しました: {str(e)}")
+    elif not due_today_pending:
+        # 送るものがないときは静かに（必要なら st.caption でもOK）
+        pass
+
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("1. 新しいタスクを追加")
     with st.form("add_task_form", clear_on_submit=True):
@@ -227,6 +292,17 @@ def main() -> None:
     if not active_tasks:
         st.caption("表示できる未完了タスクはありません。上のフォームから追加するか、完了済みはアーカイブしてください。")
         return
+
+    st.divider()
+    st.subheader("LINE通知（テスト／手動送信）")
+    due_today_pending = sorted(due_today_pending, key=lambda r: str(r.get("タイトル", "")))
+    line_test_text = _build_line_message(due_today_pending) if due_today_pending else "【Todo通知】今日が期日の未完了タスクはありません"
+    if st.button("今日が期日のタスクをLINEに通知する", use_container_width=True):
+        try:
+            _send_line_broadcast(line_test_text)
+            st.success("LINEに通知を送りました。")
+        except Exception as e:
+            st.error(f"LINE通知に失敗しました: {str(e)}")
 
     for row in active_tasks:
         tid = str(row.get("id", "")).strip()
