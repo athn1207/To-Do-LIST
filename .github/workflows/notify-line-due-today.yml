@@ -2,8 +2,8 @@ name: Notify LINE (due today)
 
 on:
   schedule:
-    # 0:00 UTC = 9:00 JST
-    - cron: "0 0 * * *"
+    # 22:00 UTC = 7:00 JST
+    - cron: "0 22 * * *"
   workflow_dispatch:
 
 jobs:
